@@ -232,6 +232,47 @@ invented fallback. The local journal remains schema-versioned and sanitized;
 it can add transaction links for the matching browser but cannot establish job
 state.
 
+## Gate 6C Mainnet seller qualification boundary
+
+Gate 6C is read-only and does not connect the Testnet demo to marketplace
+profiles. It evaluates the four versioned candidates plus at most 20 explicit
+operator-supplied Agent IDs:
+
+```text
+curated manifest + explicit Agent IDs
+  -> bounded trust8004 profile reads
+  -> one pinned BSC Mainnet identity snapshot
+  -> probes only declared A2A / HTTP ERC-8183 services
+  -> signed quote + official contract/policy checks
+  -> local sanitized qualification report
+```
+
+No list or FTS request selects qualification targets. An explicit ID remains
+`operator_explicit`, receives no curated category, and cannot increase category
+coverage until a later reviewed manifest change. Grid therefore stays empty
+unless deliberately curated evidence is added.
+
+`quote_verified` records a valid signed quote at the observation timestamp.
+The stricter `qualified` state additionally requires matching direct ERC-8004
+identity, BSC Mainnet chain and Commerce/payment-token configuration, and an
+allowlisted Router policy. The CLI never creates or funds a job, calls
+`notify_funded`, or changes `/hire`. Provider/schema failures are visible and
+do not overwrite the previous atomic report.
+
+Seller HTTP is constrained by a server-only transport. It resolves each HTTPS
+origin once, rejects non-public addresses, pins the validated addresses for the
+actual connection while retaining the original TLS hostname, rejects redirects,
+and closes its dispatcher after the probe. A2A and HTTP ERC-8183 JSON are read
+incrementally and cancelled above 64 KiB. Quotes are bound to the canonical SDK
+request hash, must be no more than 60 seconds old, and cannot exceed the SDK's
+900-second TTL.
+
+The assessor probes at most one endpoint per supported transport, two per
+agent, 48 per run, and 180 seconds overall. Skipped declarations are retained
+as `not_probed`; their presence sets `probe_incomplete` unless another endpoint
+already produced a verified quote. Per-category quote evidence and fully
+identity-qualified sellers are reported in separate fields.
+
 ## Independence requirements
 
 - Financial facts and ERC-8183 state come from chain.
