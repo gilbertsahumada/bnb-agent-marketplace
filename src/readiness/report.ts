@@ -24,17 +24,53 @@ export interface BuildReadinessReportOptions {
     agent: MarketplaceAgent,
     identity: IdentityVerification,
   ) => Promise<HireabilityAssessment>;
+  additionalAgentIds?: readonly string[];
   now?: () => number;
+}
+
+function curatedCategories(
+  inventory: Awaited<ReturnType<typeof buildBscCandidateInventory>>,
+  agentId: string,
+) {
+  return (Object.keys(inventory.categories) as MarketplaceCategory[])
+    .filter((category) => inventory.categories[category].agentIds.includes(agentId));
+}
+
+function qualification(
+  activation: HireabilityAssessment,
+  identity: IdentityVerification,
+): ReadinessCandidate["qualification"] {
+  const reasons: ReadinessCandidate["qualification"]["reasons"] = [];
+  if (identity.status === "read_error") reasons.push("IDENTITY_UNAVAILABLE");
+  else if (identity.status !== "match") reasons.push("IDENTITY_NOT_VERIFIED");
+  if (activation.declaredSellerProtocols.length === 0) reasons.push("SELLER_PROTOCOL_NOT_DECLARED");
+  else if (activation.hireability === "unreachable") reasons.push("SELLER_PROTOCOL_UNAVAILABLE");
+  else if (activation.hireability === "probe_incomplete") reasons.push("SELLER_PROBE_INCOMPLETE");
+  if (activation.quoteStatus !== "verified") reasons.push("QUOTE_NOT_VERIFIED");
+  return {
+    status: identity.status === "read_error"
+      || activation.hireability === "unreachable"
+      || activation.hireability === "probe_incomplete"
+      ? "unavailable"
+      : reasons.length === 0
+        ? "qualified"
+        : "not_qualified",
+    reasons,
+    provenance: "derived:marketplace-seller-qualification",
+  };
 }
 
 export async function buildBscMarketplaceReadinessReport(
   options: BuildReadinessReportOptions,
 ): Promise<BscMarketplaceReadinessReport> {
   const now = options.now ?? Date.now;
-  const inventory = await buildBscCandidateInventory(options.provider, now);
+  const inventory = await buildBscCandidateInventory(options.provider, now, {
+    ...(options.additionalAgentIds ? { additionalAgentIds: options.additionalAgentIds } : {}),
+  });
   const verification = await buildBscVerificationReport({
     provider: options.provider,
     identityReader: options.identityReader,
+    inventory,
     ...(options.verifyMcp ? { verifyMcp: options.verifyMcp } : {}),
     ...(options.mcpOptions ? { mcpOptions: options.mcpOptions } : {}),
     now,
@@ -45,7 +81,16 @@ export async function buildBscMarketplaceReadinessReport(
   for (const agent of inventory.agents) {
     const identity = verification.agents.find((entry) => entry.agentId === agent.agentId)?.identity;
     if (!identity) throw new Error(`Verification result missing for agent ${agent.agentId}`);
-    candidates.push({ ...agent, activation: await assessHireability(agent, identity) });
+    const activation = await assessHireability(agent, identity);
+    candidates.push({
+      ...agent,
+      activation,
+      selection: inventory.selection.explicitAgentIds.includes(agent.agentId)
+        ? "operator_explicit"
+        : "curated",
+      curatedCategories: curatedCategories(inventory, agent.agentId),
+      qualification: qualification(activation, identity),
+    });
   }
 
   const buyerProof = await verifyGate1Proof(options.gate1Reader, now);
@@ -55,14 +100,25 @@ export async function buildBscMarketplaceReadinessReport(
       const quoteVerifiedAgentIds = candidates
         .filter((agent) =>
           agent.activation.hireability === "quote_verified"
-          && agent.categories.some((entry) => entry.category === category))
+          && agent.curatedCategories.includes(category))
         .map((agent) => agent.agentId);
-      return [category, { ...source, quoteVerifiedAgentIds }];
+      const qualifiedAgentIds = candidates
+        .filter((agent) =>
+          agent.qualification.status === "qualified"
+          && agent.curatedCategories.includes(category))
+        .map((agent) => agent.agentId);
+      return [category, { ...source, quoteVerifiedAgentIds, qualifiedAgentIds }];
     }),
   ) as BscMarketplaceReadinessReport["categories"];
-  const quoteVerifiedAgents = candidates.filter(
+  const quoteVerifiedAgentIds = candidates.filter(
     (agent) => agent.activation.hireability === "quote_verified",
-  ).length;
+  ).map((agent) => agent.agentId);
+  const qualifiedSellerAgentIds = candidates.filter(
+    (agent) => agent.qualification.status === "qualified",
+  ).map((agent) => agent.agentId);
+  const qualifiedCuratedAgentIds = candidates.filter(
+    (agent) => agent.qualification.status === "qualified" && agent.selection === "curated",
+  ).map((agent) => agent.agentId);
   const quoteVerifiedCategories = Object.values(categories).filter(
     (category) => category.quoteVerifiedAgentIds.length > 0,
   ).length;
@@ -85,12 +141,33 @@ export async function buildBscMarketplaceReadinessReport(
   if (categories.grid_trading.status === "unverified") {
     warnings.push("Grid Trading remains explicitly empty/unverified.");
   }
+  if (candidates.some((agent) => agent.activation.probe.truncated)) {
+    warnings.push("One or more seller protocol probes were truncated by the bounded execution policy.");
+  }
+  const qualificationNeedsAttention = candidates.some((agent) =>
+    agent.qualification.status === "unavailable"
+    || agent.activation.probe.truncated
+    || (agent.activation.declaredSellerProtocols.length > 0
+      && agent.activation.hireability === "invalid_quote"),
+  ) || verification.agents.some((agent) => agent.identity.status === "mismatch");
+  const sellerQualification = {
+    status: qualifiedSellerAgentIds.length > 0
+      ? "passed" as const
+      : qualificationNeedsAttention
+        ? "attention_required" as const
+        : "pending_no_qualified_seller" as const,
+    qualifiedAgentIds: qualifiedSellerAgentIds,
+    note: qualifiedSellerAgentIds.length > 0
+      ? "At least one seller has matching direct identity and a currently valid signed ERC-8183 quote. Promotion remains manual."
+      : "No seller currently has both matching direct identity and a valid signed ERC-8183 quote.",
+  };
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: new Date(now()).toISOString(),
     catalog: { chainId: 56, source: "trust8004", coverage: "partial" },
     verification,
+    selection: inventory.selection,
     categories,
     candidates,
     activationCoverage: {
@@ -99,10 +176,14 @@ export async function buildBscMarketplaceReadinessReport(
         : quoteVerifiedCategories === 4
           ? "complete"
           : "partial",
-      quoteVerifiedAgents,
+      quoteVerifiedAgents: quoteVerifiedAgentIds.length,
+      quoteVerifiedAgentIds,
+      qualifiedSellerAgentIds,
+      qualifiedCuratedAgentIds,
       quoteVerifiedCategories,
       requiredCategories: 4,
     },
+    sellerQualification,
     buyerProof,
     frontendReady: blockers.length === 0,
     blockers,

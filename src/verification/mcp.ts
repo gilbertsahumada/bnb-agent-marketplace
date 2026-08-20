@@ -1,5 +1,3 @@
-import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
 import {
   Client,
   SdkHttpError,
@@ -8,8 +6,15 @@ import {
   type FetchLike,
 } from "@modelcontextprotocol/client";
 import type { McpEndpointVerification, McpVerificationStatus } from "./types.js";
+import {
+  createSafeEndpointTransport,
+  resolveSafePublicHttpsEndpoint,
+  type ResolveHostname,
+  type SafeEndpointTransport,
+} from "./safe-http.js";
 
-export type ResolveHostname = (hostname: string) => Promise<string[]>;
+export { isPublicIpAddress } from "./safe-http.js";
+export type { ResolveHostname } from "./safe-http.js";
 
 export interface McpVerifierOptions {
   fetch?: typeof fetch;
@@ -19,68 +24,11 @@ export interface McpVerifierOptions {
   monotonicNow?: () => number;
 }
 
-function isPrivateIpv4(address: string): boolean {
-  const parts = address.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
-    return true;
-  }
-  const [a, b, c] = parts as [number, number, number, number];
-  return a === 0
-    || a === 10
-    || a === 127
-    || (a === 100 && b >= 64 && b <= 127)
-    || (a === 169 && b === 254)
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && ((b === 0 && (c === 0 || c === 2)) || b === 168))
-    || (a === 198 && (b === 18 || b === 19))
-    || (a === 198 && b === 51 && c === 100)
-    || (a === 203 && b === 0 && c === 113)
-    || a >= 224;
-}
-
-function isPrivateIpv6(address: string): boolean {
-  const normalized = address.toLowerCase();
-  if (normalized === "::" || normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
-  if (/^fe[89ab]/.test(normalized) || normalized.startsWith("ff")) return true;
-  if (normalized.startsWith("2001:db8:")) return true;
-  const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
-  return mapped ? isPrivateIpv4(mapped) : false;
-}
-
-export function isPublicIpAddress(address: string): boolean {
-  const version = isIP(address);
-  if (version === 4) return !isPrivateIpv4(address);
-  if (version === 6) return !isPrivateIpv6(address);
-  return false;
-}
-
-async function defaultResolveHostname(hostname: string): Promise<string[]> {
-  const addresses = await lookup(hostname, { all: true, verbatim: true });
-  return addresses.map((entry) => entry.address);
-}
-
 export async function assertSafeMcpEndpoint(
   endpoint: string,
-  resolveHostname: ResolveHostname = defaultResolveHostname,
+  resolveHostname?: ResolveHostname,
 ): Promise<URL> {
-  let url: URL;
-  try {
-    url = new URL(endpoint);
-  } catch {
-    throw new Error("Endpoint is not a valid URL");
-  }
-  if (url.protocol !== "https:") throw new Error("Endpoint must use HTTPS");
-  if (url.username || url.password) throw new Error("Endpoint URL must not contain credentials");
-  const hostname = url.hostname.toLowerCase();
-  if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
-    throw new Error("Endpoint hostname is not public");
-  }
-  const addresses = isIP(hostname) ? [hostname] : await resolveHostname(hostname);
-  if (addresses.length === 0 || addresses.some((address) => !isPublicIpAddress(address))) {
-    throw new Error("Endpoint does not resolve exclusively to public IP addresses");
-  }
-  return url;
+  return (await resolveSafePublicHttpsEndpoint(endpoint, resolveHostname)).url;
 }
 
 function compareTools(declaredTools: string[], observedTools: string[]): {
@@ -135,9 +83,15 @@ export async function verifyMcpEndpoint(
   const observedAt = new Date(now()).toISOString();
   const timeoutMs = options.timeoutMs ?? 10_000;
   let safeUrl: URL;
+  let safeTransport: SafeEndpointTransport;
 
   try {
-    safeUrl = await assertSafeMcpEndpoint(endpoint, options.resolveHostname);
+    safeTransport = await createSafeEndpointTransport(endpoint, {
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+      ...(options.resolveHostname ? { resolveHostname: options.resolveHostname } : {}),
+      timeoutMs,
+    });
+    safeUrl = safeTransport.url;
   } catch {
     return {
       status: "unsafe_url",
@@ -155,19 +109,7 @@ export async function verifyMcpEndpoint(
     };
   }
 
-  const fetchImpl = options.fetch ?? fetch;
-  const controlledFetch: FetchLike = async (input, init) => {
-    const requestedUrl = new URL(input instanceof Request ? input.url : input.toString());
-    if (requestedUrl.origin !== safeUrl.origin || requestedUrl.protocol !== "https:") {
-      throw new Error("MCP request attempted to leave the validated origin");
-    }
-    const existingSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const signal = existingSignal
-      ? AbortSignal.any([existingSignal, timeoutSignal])
-      : timeoutSignal;
-    return fetchImpl(input, { ...init, redirect: "error", signal });
-  };
+  const controlledFetch = safeTransport.fetch as FetchLike;
   const client = new Client(
     { name: "bnb-agent-marketplace-verifier", version: "0.0.0" },
     {
@@ -219,5 +161,6 @@ export async function verifyMcpEndpoint(
   } finally {
     if (transport.sessionId) await transport.terminateSession().catch(() => undefined);
     await client.close().catch(() => undefined);
+    await safeTransport.close().catch(() => undefined);
   }
 }

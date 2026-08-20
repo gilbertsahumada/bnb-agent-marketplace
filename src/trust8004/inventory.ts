@@ -1,4 +1,5 @@
 import { Trust8004Provider } from "./provider.js";
+import { MARKETPLACE_INVENTORY } from "../data/inventory/marketplace-inventory.js";
 import {
   BSC_MAINNET_CHAIN_ID,
   CATALOG_COVERAGE,
@@ -7,60 +8,67 @@ import {
   type MarketplaceCategory,
 } from "./types.js";
 
-export const KNOWN_HEYANON_AGENT_IDS = ["45650", "45381", "45422", "43129"] as const;
+export const KNOWN_HEYANON_AGENT_IDS = MARKETPLACE_INVENTORY.entries.map((entry) => entry.agentId);
+export const MAX_EXPLICIT_QUALIFICATION_AGENT_IDS = 20;
 
-const CATEGORY_NOTES: Record<MarketplaceCategory, string> = {
-  rebalancing: "Candidates inferred from declared metadata and tools; not operationally verified.",
-  grid_trading: "No candidate is listed unless declared metadata and tools provide sufficient evidence.",
-  yield_optimisation: "Candidates inferred from declared metadata and tools; not operationally verified.",
-  health_factor_monitoring: "Candidates inferred from declared metadata and tools; not operationally verified.",
-};
+export interface BuildBscCandidateInventoryOptions {
+  additionalAgentIds?: readonly string[];
+}
 
-function hasPotentialGridEvidence(name: string, description: string | null): boolean {
-  return /\bgrid(?: trading)?\b/i.test(`${name} ${description ?? ""}`);
+export const MAX_UINT256_AGENT_ID = (1n << 256n) - 1n;
+
+function normalizedAgentId(agentId: string): string {
+  if (!/^\d+$/.test(agentId)) throw new Error(`agentId must be numeric: ${agentId}`);
+  const value = BigInt(agentId);
+  if (value > MAX_UINT256_AGENT_ID) throw new Error(`agentId exceeds uint256: ${agentId}`);
+  return value.toString();
 }
 
 export async function buildBscCandidateInventory(
   provider: Trust8004Provider,
   now: () => number = Date.now,
+  options: BuildBscCandidateInventoryOptions = {},
 ): Promise<BscCandidateInventory> {
-  const gridPage = await provider.listAgents({ search: "grid", active: true, limit: 50 });
-  const gridAgentIds = gridPage.items
-    .filter((agent) =>
-      hasPotentialGridEvidence(agent.name, agent.description)
-      && Boolean(agent.mcpEndpoint || agent.a2aEndpoint),
-    )
-    .map((agent) => agent.agentId);
-  const agentIds = [...new Set([...KNOWN_HEYANON_AGENT_IDS, ...gridAgentIds])];
+  const requestedExplicitIds = options.additionalAgentIds ?? [];
+  const curatedAgentIds = [...KNOWN_HEYANON_AGENT_IDS];
+  const curatedSet = new Set<string>(curatedAgentIds);
+  const explicitAgentIds = [...new Set(requestedExplicitIds.map(normalizedAgentId))]
+    .filter((agentId) => !curatedSet.has(agentId));
+  if (explicitAgentIds.length > MAX_EXPLICIT_QUALIFICATION_AGENT_IDS) {
+    throw new Error(`At most ${MAX_EXPLICIT_QUALIFICATION_AGENT_IDS} explicit agent IDs may be evaluated`);
+  }
+  const agentIds = [...curatedAgentIds, ...explicitAgentIds];
+  const explicitSet = new Set(explicitAgentIds);
   const agents: MarketplaceAgent[] = [];
 
-  // Keep requests sequential so inventory generation cannot burst through the public quota.
-  for (const agentId of agentIds) agents.push(await provider.getAgent(agentId));
+  // Keep profile reads sequential and bounded; never scan or classify the global catalogue here.
+  for (const agentId of agentIds) {
+    const agent = await provider.getAgent(agentId);
+    agents.push(explicitSet.has(agentId) ? { ...agent, categories: [] } : agent);
+  }
 
   const categories = Object.fromEntries(
-    (Object.keys(CATEGORY_NOTES) as MarketplaceCategory[]).map((category) => {
-      const matchingIds = agents
-        .filter((agent) => agent.categories.some((classification) => classification.category === category))
-        .map((agent) => agent.agentId);
+    (Object.keys(MARKETPLACE_INVENTORY.categories) as MarketplaceCategory[]).map((category) => {
+      const source = MARKETPLACE_INVENTORY.categories[category];
+      const matchingIds = [...source.agentIds];
       return [category, {
-        status: matchingIds.length > 0 ? "candidates" : "unverified",
+        status: source.status,
         agentIds: matchingIds,
-        note: matchingIds.length > 0
-          ? CATEGORY_NOTES[category]
-          : `${CATEGORY_NOTES[category]} The category is intentionally empty/unverified in this partial snapshot.`,
+        note: source.evidence,
       }];
     }),
   ) as BscCandidateInventory["categories"];
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: new Date(now()).toISOString(),
     chainId: BSC_MAINNET_CHAIN_ID,
+    selection: { curatedAgentIds, explicitAgentIds, evaluatedAgentIds: agentIds },
     source: {
       name: "trust8004",
       baseUrl: provider.baseUrl,
       catalogCoverage: CATALOG_COVERAGE,
-      note: "Partial trust8004 snapshot. Declared tools and derived categories are not verified capabilities.",
+      note: "Partial trust8004 snapshot. Only curated and explicitly supplied IDs were evaluated; no global classification was performed.",
     },
     categories,
     agents,

@@ -169,9 +169,14 @@ export interface Trust8004Profile {
 }
 
 export interface BscCandidateInventory {
-  schemaVersion: 1;
+  schemaVersion: 2;
   generatedAt: string;
   chainId: typeof BSC_MAINNET_CHAIN_ID;
+  selection: {
+    curatedAgentIds: string[];
+    explicitAgentIds: string[];
+    evaluatedAgentIds: string[];
+  };
   source: {
     name: "trust8004";
     baseUrl: string;

@@ -1,11 +1,13 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JobStatus, type Job } from "@bnbagent/sdk/erc8183";
+import { JobStatus, NegotiationRequest, type Job } from "@bnbagent/sdk/erc8183";
 import { describe, expect, it, vi } from "vitest";
 import type { Address, Hash, PublicClient } from "viem";
 import {
+  parseReadinessArgs,
   parseOutputPath,
+  readinessFatalMessage,
   readinessExitCode,
   writeReadinessReport,
 } from "../src/readiness/cli.js";
@@ -14,7 +16,8 @@ import { verifyGate1Proof } from "../src/readiness/gate1.js";
 import { createHireabilityAssessor } from "../src/readiness/protocols.js";
 import { buildBscMarketplaceReadinessReport } from "../src/readiness/report.js";
 import type { HireabilityAssessment } from "../src/readiness/types.js";
-import { Trust8004Provider } from "../src/trust8004/provider.js";
+import { KNOWN_HEYANON_AGENT_IDS } from "../src/trust8004/inventory.js";
+import { Trust8004HttpError, Trust8004Provider } from "../src/trust8004/provider.js";
 import type { MarketplaceAgent } from "../src/trust8004/types.js";
 import type { BscIdentityReader } from "../src/verification/onchain.js";
 import type { IdentityVerification, McpEndpointVerification } from "../src/verification/types.js";
@@ -22,6 +25,8 @@ import type { IdentityVerification, McpEndpointVerification } from "../src/verif
 const PROVIDER = "0x1111111111111111111111111111111111111111" as Address;
 const PAYMENT_TOKEN = "0x2222222222222222222222222222222222222222" as Address;
 const COMMERCE = "0x3333333333333333333333333333333333333333" as Address;
+const ROUTER = "0x4444444444444444444444444444444444444444" as Address;
+const POLICY = "0x5555555555555555555555555555555555555555" as Address;
 
 async function fixture(path: string): Promise<unknown> {
   return JSON.parse(await readFile(new URL(`./fixtures/${path}`, import.meta.url), "utf8")) as unknown;
@@ -104,14 +109,62 @@ function assessorOptions(fetchImpl: typeof fetch) {
   return {
     fetch: fetchImpl,
     resolveHostname: async () => ["93.184.216.34"],
-    now: () => 1_776_643_200_000,
+    now: () => 1_950_000_000_000,
     createQuoteContext: async () => ({
       chainId: 56 as const,
       commerce: COMMERCE,
+      router: ROUTER,
+      policy: POLICY,
       paymentToken: PAYMENT_TOKEN,
+      policyAllowlisted: true,
       publicClient: {} as PublicClient,
     }),
     verifyQuote: async () => ({ valid: true as const, method: "eip191" as const, signer: PROVIDER }),
+  };
+}
+
+function quoteVerifiedAssessment(provider: Address = PROVIDER): HireabilityAssessment {
+  return {
+    transport: "a2a",
+    declaredSellerProtocols: ["a2a"],
+    quoteStatus: "verified",
+    hireability: "quote_verified",
+    protocols: [{
+      transport: "a2a",
+      endpoint: "https://fixture.example/a2a",
+      status: "quote_verified",
+      quoteStatus: "verified",
+      agentCardSkills: ["negotiate-erc8183-job", "notify_funded"],
+      healthObserved: null,
+      statusObserved: null,
+      quote: {
+        provider,
+        price: "1",
+        currency: PAYMENT_TOKEN,
+        verifyingContract: COMMERCE,
+        contractContext: {
+          chainId: 56,
+          commerce: COMMERCE,
+          router: ROUTER,
+          policy: POLICY,
+          paymentToken: PAYMENT_TOKEN,
+          policyAllowlisted: true,
+          provenance: "configured:bnbagent-sdk+onchain:bsc-mainnet-rpc",
+        },
+        negotiationHash: `0x${"c".repeat(64)}`,
+        signatureMethod: "eip191",
+        negotiatedAt: 1_949_999_970,
+        quoteExpiresAt: 1_950_000_600,
+        observedAt: "2031-10-17T10:40:00.000Z",
+        provenance: "observed:erc8183-signed-quote",
+      },
+      observedAt: "2031-10-17T10:40:00.000Z",
+      provenance: "declared:trust8004-public-api+observed:marketplace-probe",
+      error: null,
+    }],
+    probe: { totalDeclaredEndpoints: 1, evaluatedEndpoints: 1, skippedEndpoints: 0, truncated: false },
+    note: "Signed quote verified.",
+    provenance: "derived:marketplace-readiness",
   };
 }
 
@@ -150,7 +203,22 @@ describe("ERC-8183 readiness protocols", () => {
       identity(),
     );
     expect(result).toMatchObject({ transport: "a2a", hireability: "quote_verified", quoteStatus: "verified" });
-    expect(result.protocols[0]?.quote).toMatchObject({ provider: PROVIDER, price: "1", currency: PAYMENT_TOKEN });
+    expect(result.protocols[0]?.quote).toMatchObject({
+      provider: PROVIDER,
+      price: "1",
+      currency: PAYMENT_TOKEN,
+      verifyingContract: COMMERCE,
+      contractContext: {
+        chainId: 56,
+        commerce: COMMERCE,
+        router: ROUTER,
+        policy: POLICY,
+        paymentToken: PAYMENT_TOKEN,
+        policyAllowlisted: true,
+      },
+      negotiatedAt: 1_949_999_970,
+      quoteExpiresAt: 1_950_000_600,
+    });
     expect(methods).toEqual(["negotiate-erc8183-job"]);
   });
 
@@ -184,6 +252,31 @@ describe("ERC-8183 readiness protocols", () => {
       "POST /erc8183/negotiate",
     ]);
     expect(paths.every((path) => !path.includes("agent-card"))).toBe(true);
+  });
+
+  it("cancels oversized chunked HTTP ERC-8183 responses before buffering them", async () => {
+    let cancelled = false;
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new TextEncoder().encode("x".repeat(70_000)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchImpl = (async () => new Response(body, {
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+    const result = await createHireabilityAssessor(assessorOptions(fetchImpl))(
+      agent([{ name: "ERC-8183", endpoint: "https://fixture.example/erc8183", version: null, tools: [], capabilities: [] }]),
+      identity(),
+    );
+    expect(result).toMatchObject({ hireability: "invalid_quote", quoteStatus: "invalid" });
+    expect(result.protocols[0]?.error?.message).toContain("exceeded the allowed size");
+    expect(pulls).toBeLessThanOrEqual(2);
+    expect(cancelled).toBe(true);
   });
 
   it.each([
@@ -229,6 +322,136 @@ describe("ERC-8183 readiness protocols", () => {
     );
     expect(result).toMatchObject({ hireability: "invalid_quote", quoteStatus: "invalid" });
     expect(result.protocols[0]?.error?.message).toContain("signature rejected");
+  });
+
+  it("rejects a self-consistent signed quote for a different request", async () => {
+    const quote = structuredClone(await fixture("readiness/quote.json")) as Record<string, unknown>;
+    const request = quote.request as Record<string, unknown>;
+    request.task_description = "A different signed task";
+    quote.request_hash = NegotiationRequest.fromDict(request).computeHash();
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Response.json({ result: { parts: [{ data: quote }] } })
+        : Response.json({ name: "seller", url: "https://fixture.example/a2a", skills: [{ id: "negotiate-erc8183-job" }, { id: "notify_funded" }] })) as typeof fetch;
+    const result = await createHireabilityAssessor(assessorOptions(fetchImpl))(
+      agent([{ name: "A2A", endpoint: "https://fixture.example/a2a", version: null, tools: [], capabilities: [] }]),
+      identity(),
+    );
+    expect(result).toMatchObject({ hireability: "invalid_quote", quoteStatus: "invalid" });
+    expect(result.protocols[0]?.error?.message).toContain("does not match the readiness probe");
+  });
+
+  it.each([
+    ["expired", { negotiated_at: 1_900_000_000, quote_expires_at: 1_950_000_000 }],
+    ["future", { negotiated_at: 1_960_000_000, quote_expires_at: 2_000_000_000 }],
+    ["stale", { negotiated_at: 1_949_999_900, quote_expires_at: 1_950_000_100 }],
+    ["excessive TTL", { negotiated_at: 1_949_999_970, quote_expires_at: 1_950_001_000 }],
+  ])("rejects a %s quote timestamp window", async (_name, timestamps) => {
+    const quote = structuredClone(await fixture("readiness/quote.json")) as Record<string, unknown>;
+    const response = quote.response as Record<string, unknown>;
+    response.negotiated_at = timestamps.negotiated_at;
+    response.quote_expires_at = timestamps.quote_expires_at;
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Response.json({ result: { parts: [{ data: quote }] } })
+        : Response.json({ name: "seller", url: "https://fixture.example/a2a", skills: [{ id: "negotiate-erc8183-job" }, { id: "notify_funded" }] })) as typeof fetch;
+    const result = await createHireabilityAssessor(assessorOptions(fetchImpl))(
+      agent([{ name: "A2A", endpoint: "https://fixture.example/a2a", version: null, tools: [], capabilities: [] }]),
+      identity(),
+    );
+    expect(result).toMatchObject({ hireability: "invalid_quote", quoteStatus: "invalid" });
+  });
+
+  it("rejects a quote when the configured Mainnet policy is not allowlisted", async () => {
+    const quote = await fixture("readiness/quote.json");
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Response.json({ result: { parts: [{ data: quote }] } })
+        : Response.json({ name: "seller", url: "https://fixture.example/a2a", skills: [{ id: "negotiate-erc8183-job" }, { id: "notify_funded" }] })) as typeof fetch;
+    const options = assessorOptions(fetchImpl);
+    options.createQuoteContext = async () => ({
+      chainId: 56,
+      commerce: COMMERCE,
+      router: ROUTER,
+      policy: POLICY,
+      paymentToken: PAYMENT_TOKEN,
+      policyAllowlisted: false,
+      publicClient: {} as PublicClient,
+    });
+    const result = await createHireabilityAssessor(options)(
+      agent([{ name: "A2A", endpoint: "https://fixture.example/a2a", version: null, tools: [], capabilities: [] }]),
+      identity(),
+    );
+    expect(result).toMatchObject({ hireability: "invalid_quote", quoteStatus: "invalid" });
+    expect(result.protocols[0]?.error?.message).toContain("policy is not allowlisted");
+  });
+
+  it("bounds seller endpoints per agent and reports skipped declarations", async () => {
+    const fetchImpl = vi.fn(async () => Response.json({
+      name: "seller",
+      url: "https://fixture.example/a2a-one",
+      skills: [],
+    })) as unknown as typeof fetch;
+    const result = await createHireabilityAssessor({
+      ...assessorOptions(fetchImpl),
+      maxEndpointsPerAgent: 1,
+    })(agent([
+      { name: "A2A", endpoint: "https://fixture.example/a2a-one", version: null, tools: [], capabilities: [] },
+      { name: "A2A", endpoint: "https://fixture.example/a2a-two", version: null, tools: [], capabilities: [] },
+      { name: "ERC-8183", endpoint: "https://fixture.example/erc8183", version: null, tools: [], capabilities: [] },
+    ]), identity());
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      hireability: "probe_incomplete",
+      probe: { totalDeclaredEndpoints: 3, evaluatedEndpoints: 1, skippedEndpoints: 2, truncated: true },
+    });
+    expect(result.protocols.filter((protocol) => protocol.status === "not_probed")).toHaveLength(2);
+  });
+
+  it("stops probing when the run wall-clock budget is exhausted", async () => {
+    const fetchImpl = vi.fn();
+    const monotonicNow = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValue(2);
+    const result = await createHireabilityAssessor({
+      ...assessorOptions(fetchImpl as unknown as typeof fetch),
+      monotonicNow,
+      maxTotalDurationMs: 1,
+    })(agent([
+      { name: "A2A", endpoint: "https://fixture.example/a2a", version: null, tools: [], capabilities: [] },
+    ]), identity());
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      hireability: "probe_incomplete",
+      probe: { totalDeclaredEndpoints: 1, evaluatedEndpoints: 0, skippedEndpoints: 1, truncated: true },
+    });
+    expect(result.protocols[0]?.error?.code).toBe("SELLER_PROBE_BUDGET_EXHAUSTED");
+  });
+
+  it("shares the global endpoint budget across assessed agents", async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const origin = new URL(input instanceof Request ? input.url : input.toString()).origin;
+      return Response.json({ name: "seller", url: `${origin}/a2a`, skills: [] });
+    }) as unknown as typeof fetch;
+    const assess = createHireabilityAssessor({
+      ...assessorOptions(fetchImpl),
+      maxEndpointsPerRun: 1,
+    });
+
+    await assess(agent([
+      { name: "A2A", endpoint: "https://one.example/a2a", version: null, tools: [], capabilities: [] },
+    ]), identity());
+    const second = await assess(agent([
+      { name: "A2A", endpoint: "https://two.example/a2a", version: null, tools: [], capabilities: [] },
+    ]), identity());
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(second).toMatchObject({
+      hireability: "probe_incomplete",
+      probe: { evaluatedEndpoints: 0, skippedEndpoints: 1, truncated: true },
+    });
   });
 });
 
@@ -318,7 +541,9 @@ describe("marketplace readiness report", () => {
       registryAddress: onchain.registryAddress,
       assertChain: async () => undefined,
       getBlockNumber: async () => BigInt(onchain.blockNumber),
-      readIdentity: async (agentId) => onchain.agents[agentId]!,
+      readIdentity: async (agentId) => agentId === "45422"
+        ? { ...onchain.agents[agentId]!, owner: "0x9999999999999999999999999999999999999999" }
+        : onchain.agents[agentId]!,
     };
     const verifyMcp = async (endpoint: string, tools: string[]): Promise<McpEndpointVerification> => ({
       status: "protocol_valid",
@@ -340,6 +565,7 @@ describe("marketplace readiness report", () => {
       quoteStatus: "not_applicable",
       hireability: "mcp_only",
       protocols: [],
+      probe: { totalDeclaredEndpoints: 0, evaluatedEndpoints: 0, skippedEndpoints: 0, truncated: false },
       note: "MCP is not ERC-8183 hireability.",
       provenance: "derived:marketplace-readiness",
     };
@@ -351,35 +577,144 @@ describe("marketplace readiness report", () => {
       identityReader,
       gate1Reader: gate1Reader(),
       verifyMcp,
-      assessHireability: async () => mcpOnly,
+      assessHireability: async (candidate) => candidate.agentId === "45422"
+        ? quoteVerifiedAssessment(onchain.agents["45422"]!.agentWallet)
+        : mcpOnly,
       now: () => 1_776_643_200_000,
     });
     expect(report).toMatchObject({
+      schemaVersion: 2,
       frontendReady: true,
-      activationCoverage: { status: "none", quoteVerifiedAgents: 0 },
+      selection: { curatedAgentIds: KNOWN_HEYANON_AGENT_IDS, explicitAgentIds: [] },
+      activationCoverage: {
+        status: "partial",
+        quoteVerifiedAgents: 1,
+        qualifiedSellerAgentIds: [],
+        quoteVerifiedCategories: 1,
+      },
+      sellerQualification: { status: "attention_required", qualifiedAgentIds: [] },
       buyerProof: { status: "verified" },
       catalog: { source: "trust8004", coverage: "partial" },
     });
     expect(report.candidates).toHaveLength(4);
-    expect(report.candidates.every((candidate) => candidate.activation.hireability === "mcp_only")).toBe(true);
-    expect(report.categories.grid_trading).toMatchObject({ status: "unverified", quoteVerifiedAgentIds: [] });
+    expect(report.categories.yield_optimisation).toMatchObject({
+      quoteVerifiedAgentIds: ["45422"],
+      qualifiedAgentIds: [],
+    });
+    expect(report.categories.grid_trading).toMatchObject({
+      status: "unverified",
+      quoteVerifiedAgentIds: [],
+      qualifiedAgentIds: [],
+    });
     expect(readinessExitCode(report)).toBe(0);
 
     const directory = await mkdtemp(join(tmpdir(), "bsc-readiness-"));
     try {
       const destination = join(directory, "report.json");
-      await writeReadinessReport(destination, report);
+      await Promise.all([
+        writeReadinessReport(destination, report),
+        writeReadinessReport(destination, report),
+      ]);
       expect(JSON.parse(await readFile(destination, "utf8"))).toMatchObject({ frontendReady: true });
       expect((await stat(destination)).mode & 0o777).toBe(0o600);
+      expect(await readdir(directory)).toEqual(["report.json"]);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("qualifies an explicit seller without promoting it into curated categories", async () => {
+    const [list, sourceProfiles, sourceScores, onchain] = await Promise.all([
+      fixture("trust8004/list.json"),
+      fixture("trust8004/profiles.json") as Promise<Record<string, unknown>>,
+      fixture("trust8004/scores.json") as Promise<Record<string, unknown>>,
+      fixture("verification/onchain.json") as Promise<{
+        registryAddress: Address;
+        blockNumber: string;
+        agents: Record<string, { owner: Address; agentWallet: Address; metadataUri: string }>;
+      }>,
+    ]);
+    const profiles = structuredClone(sourceProfiles);
+    const scores = structuredClone(sourceScores);
+    profiles["999"] = structuredClone(profiles["45650"]);
+    scores["999"] = structuredClone(scores["45650"]);
+    (profiles["999"] as { agent: { agentId: string; name: string } }).agent.agentId = "999";
+    (profiles["999"] as { agent: { agentId: string; name: string } }).agent.name = "Explicit seller candidate";
+    (scores["999"] as { agentId: string }).agentId = "999";
+    const explicitIdentity = onchain.agents["45650"]!;
+    const qualified = quoteVerifiedAssessment(explicitIdentity.agentWallet);
+    const mcpOnly: HireabilityAssessment = {
+      transport: "mcp_only",
+      declaredSellerProtocols: [],
+      quoteStatus: "not_applicable",
+      hireability: "mcp_only",
+      protocols: [],
+      probe: { totalDeclaredEndpoints: 0, evaluatedEndpoints: 0, skippedEndpoints: 0, truncated: false },
+      note: "MCP is not ERC-8183 hireability.",
+      provenance: "derived:marketplace-readiness",
+    };
+    const report = await buildBscMarketplaceReadinessReport({
+      provider: new Trust8004Provider({
+        fetch: trustFixtureFetch(list, profiles, scores),
+        minimumRequestIntervalMs: 0,
+      }),
+      identityReader: {
+        registryAddress: onchain.registryAddress,
+        assertChain: async () => undefined,
+        getBlockNumber: async () => BigInt(onchain.blockNumber),
+        readIdentity: async (agentId) => agentId === "999" ? explicitIdentity : onchain.agents[agentId]!,
+      },
+      gate1Reader: gate1Reader(),
+      verifyMcp: async (endpoint, declaredTools) => ({
+        status: "protocol_valid",
+        endpoint,
+        protocol: "mcp",
+        declaredTools,
+        observedTools: declaredTools,
+        comparison: { matched: declaredTools, declaredOnly: [], observedOnly: [] },
+        negotiatedProtocolVersion: "2025-06-18",
+        serverInfo: { name: "sanitized-mcp", version: "1.0.0" },
+        latencyMs: 1,
+        observedAt: "2031-10-17T10:40:00.000Z",
+        provenance: "observed:mcp-tools-list",
+        error: null,
+      }),
+      assessHireability: async (candidate) => candidate.agentId === "999" ? qualified : mcpOnly,
+      additionalAgentIds: ["999", "45650"],
+      now: () => 1_950_000_000_000,
+    });
+
+    expect(report.selection.explicitAgentIds).toEqual(["999"]);
+    expect(report.sellerQualification).toMatchObject({ status: "passed", qualifiedAgentIds: ["999"] });
+    expect(report.activationCoverage).toMatchObject({
+      qualifiedSellerAgentIds: ["999"],
+      qualifiedCuratedAgentIds: [],
+      quoteVerifiedCategories: 0,
+    });
+    expect(report.candidates.find((candidate) => candidate.agentId === "999")).toMatchObject({
+      selection: "operator_explicit",
+      categories: [],
+      curatedCategories: [],
+      qualification: { status: "qualified", reasons: [] },
+    });
+    expect(Object.values(report.categories).every((category) => !category.agentIds.includes("999"))).toBe(true);
   });
 
   it("validates CLI output arguments", () => {
     expect(parseOutputPath([])).toMatch(/\.marketplace\/readiness\/bsc-marketplace\.json$/);
     expect(parseOutputPath(["--output", "custom.json"])).toMatch(/custom\.json$/);
     expect(() => parseOutputPath(["--unknown"])).toThrow("Unknown argument");
-    expect(() => parseOutputPath(["--output"])).toThrow("requires a file path");
+    expect(() => parseOutputPath(["--output"])).toThrow("requires a value");
+    expect(parseReadinessArgs(["--agent-id", "0045650", "--agent-id", "45650"]).additionalAgentIds).toEqual(["45650"]);
+    expect(() => parseReadinessArgs(["--agent-id", "not-numeric"])).toThrow("must be numeric");
+    expect(() => parseReadinessArgs(["--agent-id", (1n << 256n).toString()])).toThrow("exceeds uint256");
+    expect(readinessFatalMessage(new Trust8004HttpError(502, "https://secret.invalid", "Bearer secret")))
+      .toBe("TRUST8004_HTTP_502: the public catalogue request failed.");
+    expect(readinessFatalMessage(new DOMException("sensitive timeout", "TimeoutError")))
+      .toBe("TRUST8004_UNAVAILABLE: the public catalogue request timed out.");
+    expect(readinessFatalMessage(new Error("--agent-id must be numeric: invalid")))
+      .toBe("INVALID_ARGUMENT: --agent-id must be numeric: invalid");
+    expect(readinessFatalMessage(new Error("--agent-id exceeds uint256: invalid")))
+      .toBe("INVALID_ARGUMENT: --agent-id exceeds uint256: invalid");
   });
 });

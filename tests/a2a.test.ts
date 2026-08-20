@@ -52,4 +52,25 @@ describe("A2A transport", () => {
       fetchAgentCard("https://seller.example", null, fakeFetch),
     ).rejects.toThrow(/allowed size/);
   });
+
+  it("cancels an oversized chunked A2A response without buffering the remainder", async () => {
+    let cancelled = false;
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new TextEncoder().encode("x".repeat(70_000)));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fakeFetch = vi.fn().mockResolvedValue(new Response(body));
+
+    await expect(
+      fetchAgentCard("https://seller.example", null, fakeFetch),
+    ).rejects.toThrow(/allowed size/);
+    expect(pulls).toBeLessThanOrEqual(2);
+    expect(cancelled).toBe(true);
+  });
 });
