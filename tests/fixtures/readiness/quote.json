@@ -1,22 +1,24 @@
 {
   "request": {
-    "task_description": "Sanitized readiness probe",
+    "task_description": "Marketplace readiness quote probe; no job will be funded",
     "terms": {
-      "deliverables": "Sanitized deterministic receipt",
-      "quality_standards": "Return a signed quote"
+      "deliverables": "Return a deterministic text readiness receipt",
+      "quality_standards": "Provide a signed ERC-8183 quote without executing work",
+      "evaluation_required": true,
+      "evaluator_type": "uma_oov3"
     }
   },
-  "request_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "request_hash": "0x071d7844d8f396a0a288c167a81a4feacebf96d53a14f569e2cdf26009f7d7a2",
   "response": {
     "accepted": true,
     "terms": {
-      "deliverables": "Sanitized deterministic receipt",
-      "quality_standards": "Return a signed quote",
+      "deliverables": "Return a deterministic text readiness receipt",
+      "quality_standards": "Provide a signed ERC-8183 quote without executing work",
       "price": "1",
       "currency": "0x2222222222222222222222222222222222222222"
     },
-    "quote_expires_at": 2000000000,
-    "negotiated_at": 1900000000
+    "quote_expires_at": 1950000600,
+    "negotiated_at": 1949999970
   },
   "response_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "negotiation_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
