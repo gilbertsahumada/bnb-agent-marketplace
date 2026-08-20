@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { buildBscCandidateInventory, KNOWN_HEYANON_AGENT_IDS } from "../src/trust8004/inventory.js";
+import {
+  buildBscCandidateInventory,
+  KNOWN_HEYANON_AGENT_IDS,
+  MAX_EXPLICIT_QUALIFICATION_AGENT_IDS,
+} from "../src/trust8004/inventory.js";
 import { Trust8004Provider } from "../src/trust8004/provider.js";
 import {
   parseAgentListResponse,
@@ -151,13 +155,22 @@ describe("Trust8004Provider", () => {
 
   it("builds a deterministic partial inventory containing all four known HeyAnon agents", async () => {
     const data = await allFixtures();
+    const requestedPaths: string[] = [];
     const provider = new Trust8004Provider({
-      fetch: fixtureFetch(data.list, data.profiles, data.scores),
+      fetch: fixtureFetch(data.list, data.profiles, data.scores, (url) => {
+        requestedPaths.push(url.pathname);
+      }),
       minimumRequestIntervalMs: 0,
     });
     const inventory = await buildBscCandidateInventory(provider, () => 1_754_000_300_000);
 
     expect(inventory.chainId).toBe(56);
+    expect(inventory.schemaVersion).toBe(2);
+    expect(inventory.selection).toEqual({
+      curatedAgentIds: KNOWN_HEYANON_AGENT_IDS,
+      explicitAgentIds: [],
+      evaluatedAgentIds: KNOWN_HEYANON_AGENT_IDS,
+    });
     expect(inventory.source.catalogCoverage).toBe("partial");
     expect(inventory.agents.map((agent) => agent.agentId)).toEqual(KNOWN_HEYANON_AGENT_IDS);
     expect(inventory.categories.rebalancing.agentIds).toContain("45650");
@@ -167,6 +180,42 @@ describe("Trust8004Provider", () => {
     expect(inventory.agents.every((agent) => agent.endpointObservation.status === "not_observed")).toBe(true);
     expect(inventory.agents.every((agent) => agent.provenance.services.kind === "declared")).toBe(true);
     expect(inventory.agents.every((agent) => agent.categories.every((category) => !category.verified))).toBe(true);
+    expect(requestedPaths).not.toContain("/api/v2/agents");
+  });
+
+  it("evaluates explicit IDs without adding them to curated categories", async () => {
+    const data = await allFixtures();
+    const profiles = structuredClone(data.profiles);
+    const scores = structuredClone(data.scores);
+    profiles["999"] = structuredClone(profiles["45650"]);
+    scores["999"] = structuredClone(scores["45650"]);
+    (profiles["999"] as { agent: { agentId: string; name: string } }).agent.agentId = "999";
+    (profiles["999"] as { agent: { agentId: string; name: string } }).agent.name = "Explicit seller candidate";
+    (scores["999"] as { agentId: string }).agentId = "999";
+    const provider = new Trust8004Provider({
+      fetch: fixtureFetch(data.list, profiles, scores),
+      minimumRequestIntervalMs: 0,
+    });
+    const inventory = await buildBscCandidateInventory(provider, Date.now, {
+      additionalAgentIds: ["0999", "999", "45650"],
+    });
+
+    expect(inventory.selection.explicitAgentIds).toEqual(["999"]);
+    expect(inventory.selection.evaluatedAgentIds).toEqual([...KNOWN_HEYANON_AGENT_IDS, "999"]);
+    expect(inventory.agents.at(-1)?.agentId).toBe("999");
+    expect(inventory.agents.at(-1)?.categories).toEqual([]);
+    expect(Object.values(inventory.categories).every((category) => !category.agentIds.includes("999"))).toBe(true);
+  });
+
+  it("bounds explicit qualification IDs", async () => {
+    const data = await allFixtures();
+    const provider = new Trust8004Provider({
+      fetch: fixtureFetch(data.list, data.profiles, data.scores),
+      minimumRequestIntervalMs: 0,
+    });
+    const ids = Array.from({ length: MAX_EXPLICIT_QUALIFICATION_AGENT_IDS + 1 }, (_, index) => String(index + 1));
+    await expect(buildBscCandidateInventory(provider, Date.now, { additionalAgentIds: ids }))
+      .rejects.toThrow(`At most ${MAX_EXPLICIT_QUALIFICATION_AGENT_IDS}`);
   });
 
   it("fails visibly with a diagnostic path when a response violates the schema", async () => {
