@@ -13,6 +13,10 @@ import {
   isPublicIpAddress,
   verifyMcpEndpoint,
 } from "../src/verification/mcp.js";
+import {
+  createPinnedLookup,
+  resolveSafePublicHttpsEndpoint,
+} from "../src/verification/safe-http.js";
 import { ViemBscIdentityReader, type BscIdentityReader } from "../src/verification/onchain.js";
 import { buildBscVerificationReport } from "../src/verification/report.js";
 import type { McpEndpointVerification } from "../src/verification/types.js";
@@ -116,6 +120,29 @@ describe("MCP verification", () => {
     await expect(assertSafeMcpEndpoint("http://example.com/mcp")).rejects.toThrow("HTTPS");
     expect(isPublicIpAddress("10.0.0.1")).toBe(false);
     expect(isPublicIpAddress("93.184.216.34")).toBe(true);
+  });
+
+  it("pins the validated public address instead of resolving DNS again", async () => {
+    let resolutions = 0;
+    const resolved = await resolveSafePublicHttpsEndpoint(
+      "https://fixture.example/mcp",
+      async () => {
+        resolutions += 1;
+        return resolutions === 1 ? ["93.184.216.34"] : ["127.0.0.1"];
+      },
+    );
+    const pinnedLookup = createPinnedLookup(resolved.addresses);
+    const connect = () => new Promise<string>((resolveAddress, reject) => {
+      pinnedLookup("fixture.example", { family: 4, all: false }, (error, address) => {
+        if (error) reject(error);
+        else if (typeof address === "string") resolveAddress(address);
+        else reject(new Error("Pinned lookup returned an unexpected address shape"));
+      });
+    });
+
+    await expect(connect()).resolves.toBe("93.184.216.34");
+    await expect(connect()).resolves.toBe("93.184.216.34");
+    expect(resolutions).toBe(1);
   });
 
   it("classifies request timeouts without exposing raw details", async () => {
