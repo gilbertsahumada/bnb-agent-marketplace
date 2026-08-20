@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readBoundedJson } from "./verification/bounded-json.js";
 
 export interface AgentCard {
   name: string;
@@ -21,19 +22,11 @@ interface RpcReply {
 const MAX_A2A_RESPONSE_BYTES = 64 * 1024;
 
 async function boundedJson(response: Response): Promise<unknown> {
-  const contentLength = Number(response.headers.get("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > MAX_A2A_RESPONSE_BYTES) {
-    throw new Error("A2A response exceeded the allowed size");
-  }
-  const text = await response.text();
-  if (new TextEncoder().encode(text).byteLength > MAX_A2A_RESPONSE_BYTES) {
-    throw new Error("A2A response exceeded the allowed size");
-  }
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    throw new Error("A2A response was not valid JSON");
-  }
+  return readBoundedJson(response, {
+    maxBytes: MAX_A2A_RESPONSE_BYTES,
+    tooLargeMessage: "A2A response exceeded the allowed size",
+    invalidJsonMessage: "A2A response was not valid JSON",
+  });
 }
 
 export function agentCardUrl(endpoint: string): string {
