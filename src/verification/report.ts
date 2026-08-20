@@ -1,7 +1,7 @@
 import { getAddress, isAddress } from "viem";
 import { buildBscCandidateInventory } from "../trust8004/inventory.js";
 import type { Trust8004Provider } from "../trust8004/provider.js";
-import type { MarketplaceAgent } from "../trust8004/types.js";
+import type { BscCandidateInventory, MarketplaceAgent, MarketplaceCategory } from "../trust8004/types.js";
 import type { BscIdentityReader } from "./onchain.js";
 import { verifyMcpEndpoint, type McpVerifierOptions } from "./mcp.js";
 import type {
@@ -15,9 +15,18 @@ import type {
 export interface BuildVerificationReportOptions {
   provider: Trust8004Provider;
   identityReader: BscIdentityReader;
+  inventory?: BscCandidateInventory;
   verifyMcp?: typeof verifyMcpEndpoint;
   mcpOptions?: McpVerifierOptions;
   now?: () => number;
+}
+
+function curatedCategories(
+  inventory: BscCandidateInventory,
+  agentId: string,
+): MarketplaceCategory[] {
+  return (Object.keys(inventory.categories) as MarketplaceCategory[])
+    .filter((category) => inventory.categories[category].agentIds.includes(agentId));
 }
 
 function sanitizedError(error: unknown, code: string): VerificationError {
@@ -111,7 +120,7 @@ export async function buildBscVerificationReport(
 ): Promise<BscVerificationReport> {
   const now = options.now ?? Date.now;
   const verifyMcp = options.verifyMcp ?? verifyMcpEndpoint;
-  const inventory = await buildBscCandidateInventory(options.provider, now);
+  const inventory = options.inventory ?? await buildBscCandidateInventory(options.provider, now);
   await options.identityReader.assertChain();
   const blockNumber = await options.identityReader.getBlockNumber();
   const generatedAt = new Date(now()).toISOString();
@@ -126,7 +135,7 @@ export async function buildBscVerificationReport(
     agents.push({
       agentId: agent.agentId,
       name: agent.name,
-      categories: agent.categories.map((classification) => classification.category),
+      categories: curatedCategories(inventory, agent.agentId),
       identity,
       mcpEndpoints,
       hireability: "not_assessed",
